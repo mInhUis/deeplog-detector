@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python src/models/train_deeplog.py --mode mock)",
+      "Bash(python -m pytest tests/test_deeplog.py -v)"
+    ]
+  }
+}

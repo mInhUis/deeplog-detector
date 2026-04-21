@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/preprocess_flaws.py)",
+      "Bash(python scripts/validate_logs.py)",
+      "Bash(mkdir -p data/raw data/processed src/parser src/detector src/responder src/pipeline tests)",
+      "Bash(touch src/__init__.py src/parser/__init__.py src/detector/__init__.py src/responder/__init__.py src/pipeline/__init__.py tests/__init__.py)",
+      "Bash(python -m pytest tests/test_preprocess.py -v)",
+      "Bash(pip install:*)",
+      "Bash(where python:*)",
+      "Bash(C:UsersDELLAppDataLocalProgramsPythonPython313python.exe -m pip install pytest pandas --quiet)",
+      "Bash(python -m pip install pytest pandas --quiet)",
+      "Bash(python -m pytest tests/test_deeplog.py -v)",
+      "Bash(pip list:*)",
+      "Bash(pip show:*)",
+      "Bash(python -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(python -m pip install torch --index-url https://download.pytorch.org/whl/cpu)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -m pytest tests/test_llama_inference.py -v)",
+      "Bash(python src/main.py --mode mock_inference)",
+      "Bash(python src/main.py --mode mock_inference --top-k 3)"
+    ]
+  }
+}
