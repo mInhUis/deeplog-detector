@@ -18,7 +18,9 @@
       "Bash(python -m pytest tests/ -v)",
       "Bash(python -m pytest tests/test_llama_inference.py -v)",
       "Bash(python src/main.py --mode mock_inference)",
-      "Bash(python src/main.py --mode mock_inference --top-k 3)"
+      "Bash(python src/main.py --mode mock_inference --top-k 3)",
+      "Bash(python scripts/validate_sessions.py)",
+      "Bash(python src/pipeline/preprocess.py)"
     ]
   }
 }
