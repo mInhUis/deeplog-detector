@@ -27,7 +27,7 @@ Heavy Compute Warning (CLAUDE.md):
 
 Environment Variables:
     RESPONDER_MODEL     – HuggingFace model ID
-                          (default: unsloth/llama-3-8b-Instruct-bnb-4bit)
+                          (default: unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit)
     RESPONDER_MOCK      – "true" to force mock mode (default: "false")
     RESPONDER_MAX_TOKENS – Max new tokens to generate (default: 1024)
     CUDA_MEMORY_MAX     – Max VRAM fraction (0.0–1.0, default: 0.5)
@@ -65,7 +65,7 @@ class ResponderConfig:
                             interactive sessions and CI.
     """
 
-    model_name: str = "unsloth/llama-3-8b-Instruct-bnb-4bit"
+    model_name: str = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
     max_new_tokens: int = 1024
     temperature: float = 0.3
     top_p: float = 0.9

@@ -20,7 +20,8 @@
       "Bash(python src/main.py --mode mock_inference)",
       "Bash(python src/main.py --mode mock_inference --top-k 3)",
       "Bash(python scripts/validate_sessions.py)",
-      "Bash(python src/pipeline/preprocess.py)"
+      "Bash(python src/pipeline/preprocess.py)",
+      "Bash(python -m pytest tests/test_preprocess.py --collect-only)"
     ]
   }
 }

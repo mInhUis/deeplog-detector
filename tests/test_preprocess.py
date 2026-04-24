@@ -12,6 +12,7 @@ Event D — Noisy scanner action (userAgent='CloudMapper') → expected NOWHERE
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any, Final
 
@@ -21,12 +22,13 @@ import pytest
 from src.pipeline.preprocess import (
     assign_sessions,
     convert_and_sort_by_time,
+    count_lines,
     fill_missing_strings,
     filter_noise,
     flatten_records,
-    load_jsonl,
     save_csv,
     split_train_test,
+    stream_jsonl,
 )
 
 # ======================================================================== #
@@ -115,6 +117,29 @@ MOCK_RECORDS: Final[list[dict[str, Any]]] = [EVENT_A, EVENT_B, EVENT_C, EVENT_D]
 
 
 # ======================================================================== #
+#  Test helpers                                                             #
+# ======================================================================== #
+
+def _flatten_list(records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Flatten an in-memory list of records through flatten_records.
+
+    flatten_records now expects a JSONL file path (streaming pipeline).
+    This helper serialises the list to a self-cleaning NamedTemporaryFile
+    so individual tests stay free of tmp_path boilerplate.
+    """
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+    ) as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+        tmp = Path(fh.name)
+    try:
+        return flatten_records(tmp, len(records))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# ======================================================================== #
 #  Fixtures                                                                 #
 # ======================================================================== #
 
@@ -133,36 +158,37 @@ def mock_jsonl(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def flat_df() -> pd.DataFrame:
+def flat_df(mock_jsonl: Path) -> pd.DataFrame:
     """Return a flattened, time-sorted, null-filled DataFrame for reuse."""
-    df: pd.DataFrame = flatten_records(MOCK_RECORDS)
+    total: int = count_lines(mock_jsonl)
+    df: pd.DataFrame = flatten_records(mock_jsonl, total)
     df = convert_and_sort_by_time(df)
     df = fill_missing_strings(df)
     return df
 
 
 # ======================================================================== #
-#  Stage 1 — load_jsonl                                                     #
+#  Stage 1 — stream_jsonl / count_lines                                     #
 # ======================================================================== #
 
-class TestLoadJsonl:
-    """Tests for the JSONL loader."""
+class TestStreamJsonl:
+    """Tests for the streaming JSONL generator and line counter."""
 
-    def test_loads_correct_count(self, mock_jsonl: Path) -> None:
-        """All four lines should be parsed into four dicts."""
-        records: list[dict[str, Any]] = load_jsonl(mock_jsonl)
+    def test_yields_correct_count(self, mock_jsonl: Path) -> None:
+        """All four lines should be yielded as four dicts."""
+        records: list[dict[str, Any]] = list(stream_jsonl(mock_jsonl))
         assert len(records) == 4
 
     def test_preserves_nested_structure(self, mock_jsonl: Path) -> None:
         """Nested dicts like userIdentity must survive the round-trip."""
-        records = load_jsonl(mock_jsonl)
+        records = list(stream_jsonl(mock_jsonl))
         first_type: str = records[0]["userIdentity"]["type"]
         assert first_type in {"Root", "IAMUser"}
 
     def test_file_not_found_raises(self, tmp_path: Path) -> None:
         """A missing file must raise FileNotFoundError, not silently return."""
         with pytest.raises(FileNotFoundError):
-            load_jsonl(tmp_path / "nonexistent.jsonl")
+            list(stream_jsonl(tmp_path / "nonexistent.jsonl"))
 
     def test_skips_blank_lines(self, tmp_path: Path) -> None:
         """Blank or whitespace-only lines must be silently skipped."""
@@ -172,7 +198,11 @@ class TestLoadJsonl:
             fh.write("\n")
             fh.write("   \n")
             fh.write(json.dumps(EVENT_B) + "\n")
-        assert len(load_jsonl(jsonl_file)) == 2
+        assert len(list(stream_jsonl(jsonl_file))) == 2
+
+    def test_count_lines_matches_yield_count(self, mock_jsonl: Path) -> None:
+        """count_lines must agree with the number of records yielded."""
+        assert count_lines(mock_jsonl) == len(list(stream_jsonl(mock_jsonl)))
 
 
 # ======================================================================== #
@@ -182,20 +212,20 @@ class TestLoadJsonl:
 class TestFlattenRecords:
     """Tests for pd.json_normalize flattening."""
 
-    def test_row_count(self) -> None:
+    def test_row_count(self, mock_jsonl: Path) -> None:
         """One row per input record."""
-        df: pd.DataFrame = flatten_records(MOCK_RECORDS)
+        df: pd.DataFrame = flatten_records(mock_jsonl, count_lines(mock_jsonl))
         assert len(df) == 4
 
-    def test_nested_keys_become_dot_separated(self) -> None:
+    def test_nested_keys_become_dot_separated(self, mock_jsonl: Path) -> None:
         """userIdentity.type must exist as a flattened column."""
-        df = flatten_records(MOCK_RECORDS)
+        df = flatten_records(mock_jsonl, count_lines(mock_jsonl))
         assert "userIdentity.type" in df.columns
         assert "userIdentity.arn" in df.columns
 
-    def test_original_nested_dict_column_absent(self) -> None:
+    def test_original_nested_dict_column_absent(self, mock_jsonl: Path) -> None:
         """The raw 'userIdentity' dict column must not survive flattening."""
-        df = flatten_records(MOCK_RECORDS)
+        df = flatten_records(mock_jsonl, count_lines(mock_jsonl))
         assert "userIdentity" not in df.columns
 
 
@@ -206,22 +236,22 @@ class TestFlattenRecords:
 class TestConvertAndSort:
     """Tests for datetime conversion and chronological ordering."""
 
-    def test_eventtime_is_datetime(self) -> None:
+    def test_eventtime_is_datetime(self, mock_jsonl: Path) -> None:
         """eventTime must be converted to a datetime64 dtype."""
-        df = flatten_records(MOCK_RECORDS)
+        df = flatten_records(mock_jsonl, count_lines(mock_jsonl))
         df = convert_and_sort_by_time(df)
         assert pd.api.types.is_datetime64_any_dtype(df["eventTime"])
 
-    def test_chronological_order(self) -> None:
+    def test_chronological_order(self, mock_jsonl: Path) -> None:
         """Rows must be sorted earliest-first: D(18h), C(19h), A(20h), B(21h)."""
-        df = flatten_records(MOCK_RECORDS)
+        df = flatten_records(mock_jsonl, count_lines(mock_jsonl))
         df = convert_and_sort_by_time(df)
         event_ids: list[str] = df["eventID"].tolist()
         assert event_ids == ["dddd-dddd", "cccc-cccc", "aaaa-aaaa", "bbbb-bbbb"]
 
-    def test_index_is_reset(self) -> None:
+    def test_index_is_reset(self, mock_jsonl: Path) -> None:
         """Index must be a clean 0..n-1 range after sorting."""
-        df = flatten_records(MOCK_RECORDS)
+        df = flatten_records(mock_jsonl, count_lines(mock_jsonl))
         df = convert_and_sort_by_time(df)
         assert list(df.index) == [0, 1, 2, 3]
 
@@ -317,7 +347,7 @@ class TestFilterNoise:
     def test_boto3_noise_dropped(self) -> None:
         """A row with 'boto3' in userAgent must also be dropped."""
         noisy: dict[str, Any] = {**EVENT_A, "userAgent": "boto3/1.26.0", "eventID": "noisy"}
-        df = flatten_records([EVENT_A, noisy])
+        df = _flatten_list([EVENT_A, noisy])
         df = convert_and_sort_by_time(df)
         df = fill_missing_strings(df)
         df = filter_noise(df)
@@ -360,7 +390,7 @@ class TestAssignSessions:
             "eventTime": "2017-02-12T20:05:00Z",
             "eventID": "aaaa-twin",
         }
-        df = flatten_records([EVENT_A, twin])
+        df = _flatten_list([EVENT_A, twin])
         df = convert_and_sort_by_time(df)
         df = fill_missing_strings(df)
         df = assign_sessions(df)
@@ -406,12 +436,12 @@ class TestEndToEnd:
 
     def test_full_pipeline(self, mock_jsonl: Path, tmp_path: Path) -> None:
         """Run every stage in sequence and verify final train/test content."""
-        # Stage 1 — Load
-        records: list[dict[str, Any]] = load_jsonl(mock_jsonl)
-        assert len(records) == 4
+        # Stage 1 — count & stream
+        total: int = count_lines(mock_jsonl)
+        assert total == 4
 
         # Stage 2 — Flatten
-        df: pd.DataFrame = flatten_records(records)
+        df: pd.DataFrame = flatten_records(mock_jsonl, total)
         assert "userIdentity.type" in df.columns
 
         # Stage 3 — Sort

@@ -388,9 +388,10 @@ def assign_sessions(df: pd.DataFrame) -> pd.DataFrame:
     df["sessionSeqNo"] = df.groupby("sessionId").cumcount()
 
     # Fix: Restore global temporal sorting before writing to CSV.
-    # Use a stable sort so that events sharing the same eventTime keep the
-    # intra-session order their sessionSeqNo values were assigned in.
-    df = df.sort_values("eventTime", kind="stable").reset_index(drop=True)
+    # Secondary keys (sessionId, sessionSeqNo) break eventTime ties
+    # deterministically so intra-session order is preserved without
+    # relying on sort stability.
+    df = df.sort_values(["eventTime", "sessionId", "sessionSeqNo"]).reset_index(drop=True)
 
     return df
 
