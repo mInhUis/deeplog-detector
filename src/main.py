@@ -52,10 +52,13 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import torch
+from torch.utils.data import DataLoader
 
 from src.parser.drain_parser import DrainParser
+from src.detector.dataset import LogKeyDataset
 from src.detector.deeplog import DeepLogModel
 from src.detector.detect import detect_anomalies
+from src.models.train_deeplog import train as _train_deeplog
 from src.responder.llama_inference import (
     LlamaResponder,
     ResponderConfig,
@@ -69,6 +72,24 @@ _DEFAULT_TOP_K: Final[int] = 9
 _CUDA_MEMORY_MAX: Final[float] = float(
     os.environ.get("CUDA_MEMORY_MAX", "0.5"),
 )
+
+# ---------------------------------------------------------------------------
+# Mock-inference fixtures (used by ``--mode mock_inference`` and tests).
+# Keys 0–4 are benign read-only AWS API calls; keys 5–7 are the
+# privilege-escalation pattern we want DeepLog to flag in session 4.
+# ---------------------------------------------------------------------------
+_MOCK_NUM_KEYS: Final[int] = 8
+_MOCK_TEMPLATES: Final[dict[int, str]] = {
+    0: "ListBuckets <*>",
+    1: "GetObject <*>",
+    2: "DescribeInstances <*>",
+    3: "ListUsers <*>",
+    4: "GetCallerIdentity <*>",
+    5: "CreateUser <*>",
+    6: "AttachUserPolicy <*>",
+    7: "CreateAccessKey <*>",
+}
+_MOCK_WINDOW_SIZE: Final[int] = 3
 
 
 # ======================================================================== #
@@ -86,16 +107,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Cloud Log Analytics — End-to-End Incident Response Pipeline",
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="full",
+        choices=["full", "mock_inference"],
+        help=(
+            "Pipeline mode. 'full' loads real CloudTrail data and a "
+            "trained DeepLog checkpoint. 'mock_inference' uses a "
+            "synthetic 5-session dataset and a quick-trained model "
+            "(safe for interactive runs per CLAUDE.md)."
+        ),
+    )
+    parser.add_argument(
         "--input_file",
         type=str,
-        required=True,
-        help="Path to raw CloudTrail JSON (.json array or .jsonl).",
+        default=None,
+        help=(
+            "Path to raw CloudTrail JSON (.json array or .jsonl). "
+            "Required for --mode full."
+        ),
     )
     parser.add_argument(
         "--deeplog_ckpt",
         type=str,
-        required=True,
-        help="Path to saved DeepLog model checkpoint (e.g. models/deeplog.pt).",
+        default=None,
+        help=(
+            "Path to saved DeepLog model checkpoint (e.g. models/deeplog.pt). "
+            "Required for --mode full."
+        ),
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=_DEFAULT_TOP_K,
+        help=(
+            "Top-k threshold for DeepLog next-key anomaly detection. "
+            "An event is flagged when its true key is not among the "
+            "model's top-k predictions."
+        ),
+    )
+    parser.add_argument(
+        "--report_output",
+        type=str,
+        default=None,
+        help="Optional file path to write the generated report(s) to.",
     )
     parser.add_argument(
         "--mock_llm",
@@ -261,6 +316,70 @@ def _extract_session_metadata(
 
 
 # ======================================================================== #
+#  Mock pipeline data                                                       #
+# ======================================================================== #
+
+def generate_mock_pipeline_data() -> tuple[
+    list[list[int]], dict[int, str], list[dict[str, Any]],
+]:
+    """Build a deterministic mini dataset for ``--mode mock_inference``.
+
+    Produces 5 sessions of length 15 over the 8-key vocabulary in
+    ``_MOCK_TEMPLATES``. Sessions 0–3 use only the 5 benign keys
+    ``{0,1,2,3,4}``; session 4 (the "attack") embeds every suspicious
+    key ``{5,6,7}`` so an undertrained DeepLog flags it under low
+    ``top_k``. Determinism is enforced by hand-crafted patterns rather
+    than ``random``, so test assertions hold across Python runs.
+
+    Returns:
+        Tuple of ``(sessions, templates, metadata)`` mirroring the
+        shapes produced by the real Drain + ``_extract_session_metadata``
+        path so the rest of the pipeline can consume them unchanged.
+    """
+    normal_pool: list[int] = [0, 1, 2, 3, 4]
+    sessions: list[list[int]] = []
+
+    # Sessions 0–3: rotate the 5-key benign pool to keep each session
+    # distinct but still anomaly-free relative to itself.
+    for s_idx in range(4):
+        rotated: list[int] = (
+            normal_pool[s_idx:] + normal_pool[:s_idx]
+        )
+        sessions.append([rotated[i % 5] for i in range(15)])
+
+    # Session 4: privilege-escalation pattern. Suspicious keys 5/6/7
+    # appear at fixed positions and are surrounded by benign reads.
+    attack: list[int] = [
+        0, 1, 2, 0, 1,   # benign warm-up
+        5, 6, 7,         # CreateUser → AttachUserPolicy → CreateAccessKey
+        3, 4, 0,         # benign cool-down
+        5, 6, 7, 0,      # repeat pattern + trailing benign
+    ]
+    sessions.append(attack)
+
+    templates: dict[int, str] = dict(_MOCK_TEMPLATES)
+
+    metadata: list[dict[str, Any]] = []
+    for s_idx, session in enumerate(sessions):
+        metadata.append({
+            "session_id": s_idx,
+            "timestamps": [
+                f"2026-04-25T00:00:{j:02d}Z" for j in range(len(session))
+            ],
+            "source_ips": [f"10.0.0.{s_idx}" for _ in session],
+            "user_arns": [
+                f"arn:aws:iam::000000000000:user/mock{s_idx}"
+                for _ in session
+            ],
+            "event_names": [
+                templates[k].split(" ", 1)[0] for k in session
+            ],
+        })
+
+    return sessions, templates, metadata
+
+
+# ======================================================================== #
 #  Checkpoint loader                                                        #
 # ======================================================================== #
 
@@ -330,7 +449,7 @@ def reverse_map_anomalies(
     sessions: list[list[int]],
     anomaly_flags: list[list[bool]],
     templates: dict[int, str],
-    session_metadata: list[dict[str, Any]],
+    session_metadata: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Translate DeepLog anomaly flags back to human-readable Drain templates.
 
@@ -356,6 +475,9 @@ def reverse_map_anomalies(
             ``context``         : dict       (metadata for the responder)
     """
     results: list[dict[str, Any]] = []
+    metadata: list[dict[str, Any]] = (
+        session_metadata if session_metadata is not None else []
+    )
 
     for s_idx, (seq, flags) in enumerate(zip(sessions, anomaly_flags)):
         anomaly_indices: list[int] = [
@@ -372,9 +494,7 @@ def reverse_map_anomalies(
 
         # Build context dict for the responder
         meta: dict[str, Any] = (
-            session_metadata[s_idx]
-            if s_idx < len(session_metadata)
-            else {}
+            metadata[s_idx] if s_idx < len(metadata) else {}
         )
         context: dict[str, Any] = {
             "session_id": meta.get("session_id", s_idx),
@@ -433,6 +553,9 @@ def run_pipeline(args: argparse.Namespace) -> str | None:
         ValueError: If the model's embedding table does not match the
                     number of Drain templates (stale model).
     """
+    if getattr(args, "mode", None) == "mock_inference":
+        return _run_mock_pipeline(args)
+
     input_path: Path = Path(args.input_file)
     ckpt_path: Path = Path(args.deeplog_ckpt)
 
@@ -538,7 +661,8 @@ def run_pipeline(args: argparse.Namespace) -> str | None:
     # ================================================================== #
     # Cap top_k to the model's vocabulary size to prevent torch.topk
     # from raising when k > number of output classes.
-    effective_top_k: int = min(_DEFAULT_TOP_K, num_embeddings)
+    requested_top_k: int = int(getattr(args, "top_k", _DEFAULT_TOP_K))
+    effective_top_k: int = min(requested_top_k, num_embeddings)
     print(
         f"[Step 3/5] Running DeepLog anomaly detection "
         f"(top_k={effective_top_k}) ..."
@@ -618,7 +742,7 @@ def run_pipeline(args: argparse.Namespace) -> str | None:
             ResponderConfig(
                 model_name=os.environ.get(
                     "RESPONDER_MODEL",
-                    "unsloth/llama-3-8b-Instruct-bnb-4bit",
+                    "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
                 ),
                 max_new_tokens=int(
                     os.environ.get("RESPONDER_MAX_TOKENS", "1024"),
@@ -645,6 +769,104 @@ def run_pipeline(args: argparse.Namespace) -> str | None:
 
     full_output: str = ("\n\n" + "=" * 72 + "\n\n").join(output_parts)
     print("\n[Done] Pipeline complete.")
+    return full_output
+
+
+# ======================================================================== #
+#  Mock-inference pipeline                                                  #
+# ======================================================================== #
+
+def _run_mock_pipeline(args: argparse.Namespace) -> str | None:
+    """Run the end-to-end pipeline on the synthetic mock dataset.
+
+    Skips CloudTrail loading, Drain, and the real Llama-3 model. The
+    DeepLog model is freshly initialised and quick-trained for 20
+    epochs on the four normal sessions only (semi-supervised baseline)
+    before scoring all 5 sessions.
+
+    Args:
+        args: Namespace with optional ``top_k`` and ``report_output``.
+
+    Returns:
+        The joined 5-section incident report string, or ``None`` when
+        DeepLog flags no anomalies (possible at high ``top_k``).
+    """
+    print("[mock] Generating synthetic sessions, templates, metadata ...")
+    sessions, templates, metadata = generate_mock_pipeline_data()
+
+    torch.manual_seed(0)
+    device: torch.device = torch.device("cpu")
+
+    model: DeepLogModel = DeepLogModel(
+        num_keys=_MOCK_NUM_KEYS,
+        embedding_dim=16,
+        hidden_size=16,
+        num_layers=1,
+        dropout=0.0,
+    )
+
+    # Quick semi-supervised pre-training on the 4 normal sessions only.
+    normal_sessions: list[list[int]] = sessions[:4]
+    dataset: LogKeyDataset = LogKeyDataset(
+        normal_sessions, window_size=_MOCK_WINDOW_SIZE,
+    )
+    loader: DataLoader = DataLoader(dataset, batch_size=8, shuffle=True)
+    print("[mock] Quick-training DeepLog (20 epochs, normal sessions) ...")
+    _train_deeplog(
+        model=model,
+        dataloader=loader,
+        epochs=20,
+        lr=0.01,
+        device=device,
+    )
+    model.eval()
+
+    requested_top_k: int = int(getattr(args, "top_k", _DEFAULT_TOP_K))
+    effective_top_k: int = min(requested_top_k, _MOCK_NUM_KEYS)
+    print(f"[mock] Detecting anomalies (top_k={effective_top_k}) ...")
+    anomaly_flags: list[list[bool]] = detect_anomalies(
+        model=model,
+        sequences=sessions,
+        window_size=_MOCK_WINDOW_SIZE,
+        top_k=effective_top_k,
+        device=device,
+    )
+
+    total_anomalies: int = sum(
+        flag for session_flags in anomaly_flags for flag in session_flags
+    )
+    if total_anomalies == 0:
+        print("[mock] No anomalies detected.")
+        return None
+
+    mapped: list[dict[str, Any]] = reverse_map_anomalies(
+        sessions=sessions,
+        anomaly_flags=anomaly_flags,
+        templates=templates,
+        session_metadata=metadata,
+    )
+    if not mapped:
+        return None
+
+    responder: LlamaResponder = LlamaResponder(
+        ResponderConfig(mock_mode=True),
+    )
+    output_parts: list[str] = []
+    for entry in mapped:
+        report: str = responder.generate_report(
+            anomalous_logs=entry["anomalous_logs"],
+            context=entry["context"],
+        )
+        output_parts.append(report)
+
+    full_output: str = ("\n\n" + "=" * 72 + "\n\n").join(output_parts)
+
+    report_output: str | None = getattr(args, "report_output", None)
+    if report_output:
+        Path(report_output).write_text(full_output, encoding="utf-8")
+        print(f"[mock] Wrote report to {report_output}")
+
+    print("[mock] Pipeline complete.")
     return full_output
 
 

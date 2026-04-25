@@ -71,7 +71,7 @@ class TestResponderConfig:
 
     def test_defaults(self) -> None:
         cfg = ResponderConfig()
-        assert cfg.model_name == "unsloth/llama-3-8b-Instruct-bnb-4bit"
+        assert cfg.model_name == "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
         assert cfg.max_new_tokens == 1024
         assert cfg.temperature == pytest.approx(0.3)
         assert cfg.top_p == pytest.approx(0.9)
